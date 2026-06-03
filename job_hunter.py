@@ -1,22 +1,27 @@
 # ==============================================================
-#   JOB HUNTING AI AUTOMATION TOOL  v3.0
+#   JOB HUNTING AI AUTOMATION TOOL  v4.0
 #   Platforms : Indeed · LinkedIn · Glassdoor · Google · ZipRecruiter
-#   Output    : Google Sheets (append-only — one sheet, 3 tabs)
+#   Output    : Google Sheets (append-only — 3 tabs)
 #
 #   Tabs:
-#     "All Jobs"   — every filtered job, appended on each run
-#     "Seen Jobs"  — deduplication log (replaces seen_jobs.json)
+#     "All Jobs"   — every qualified job, appended each run
+#     "Seen Jobs"  — cross-run deduplication log
 #     "Summary"    — latest run stats (overwritten each run)
 #
-#   Filters applied (ALL must pass):
-#     1. Fully remote only
-#     2. Salesforce-relevant title · excluded non-tech titles
-#     3. Cross-run deduplication (Seen Jobs tab)
-#     4. Minimum 5 years of experience (from description)
-#     5. Compensation: hourly $80-$90  OR  annual >= $150K
+#   Filters applied (ALL must pass to be saved):
+#     1. Fully remote, not hybrid, not on-site
+#     2. Salesforce-relevant title, excluded non-tech titles
+#     3. Cross-run deduplication
+#     4. Travel ≤ 20%  (unspecified % → flagged in Notes)
+#     5. Minimum 5 years of experience (from description)
+#     6. Compensation: hourly $80–$90  OR  annual >= $150K
 #        (jobs with no salary listed are included by default)
 #
-#   Job types fetched: fulltime + contract (separate API calls)
+#   Scoring (High / Medium / Low) applied to every passing job.
+#   Results sorted: High → Medium → Low → Date → C2C mention.
+#
+#   Configuration: edit config.py only — do not touch this file
+#                  to change ICP, keywords, or thresholds.
 #
 #   Environment variables required:
 #     APIFY_API_TOKEN         — Apify API key
@@ -29,95 +34,83 @@
 from apify_client import ApifyClient
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
+from config import (
+    ICP, SEARCH_KEYWORDS, LOCATIONS, SITES, JOB_TYPES,
+    MAX_RESULTS_PER_SITE, HOURS_OLD, COUNTRY_INDEED,
+    MIN_EXP_YEARS, MAX_TRAVEL_PCT,
+    HOURLY_MIN, HOURLY_MAX, ANNUAL_MIN, INCLUDE_NO_SALARY,
+    REQUIRED_TITLE_TERMS, EXCLUDED_TITLE_TERMS,
+)
 import gspread
 import pandas as pd
 from datetime import datetime, timedelta
 import time, os, json, re
 
-# Load .env for local development (no-op in GitHub Actions where env vars come from Secrets)
+# Load .env for local dev (no-op in GitHub Actions)
 load_dotenv()
 
 
 # ==============================================================
-#   CONFIGURATION
+#   ENVIRONMENT / CREDENTIALS
 # ==============================================================
 
-# Loaded from .env locally, from GitHub Secrets in CI
 APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
-
-SEARCH_KEYWORDS = [
-    "Salesforce Engineer",
-    "Lead Salesforce",
-    "Salesforce Developer",
-    "Salesforce Architect",
-    "CRM Developer",
-    "Salesforce CPQ Developer",
-]
-
-LOCATIONS = [
-    "United States",
-    "Remote",
-]
-
-SITES = [
-    "indeed",
-    "linkedin",
-    "glassdoor",
-    "google",
-    "zip_recruiter",
-]
-
-# Both job types fetched in separate API calls per keyword/location
-JOB_TYPES = ["fulltime", "contract"]
-
-MAX_RESULTS_PER_SITE = 20
-HOURS_OLD            = 24
-COUNTRY_INDEED       = "usa"
-
-# ── Filtering thresholds ────────────────────────────────────────
-MIN_EXP_YEARS     = 5
-HOURLY_MIN        = 80
-HOURLY_MAX        = 90
-ANNUAL_MIN        = 150_000
-INCLUDE_NO_SALARY = True    # include jobs that list no salary
-
-# Title must contain at least one of these
-REQUIRED_TITLE_TERMS = [
-    "salesforce", "sfdc", "cpq", "apex", "lightning", "crm",
-    "service cloud", "sales cloud", "marketing cloud",
-]
-
-# Jobs whose title contains any of these are excluded
-EXCLUDED_TITLE_TERMS = [
-    "sales rep", "sales representative", "account executive",
-    "account manager", "customer success", "marketing",
-    "recruiter", "data entry", "sales manager",
-    "business development", "inside sales", "business analyst",
-]
-
-# Column order written to Google Sheets
-JOBS_HEADERS = [
-    "Search Keyword", "Platform", "Job Title", "Company Name",
-    "Location", "Remote", "Job Type", "Salary", "Date Posted",
-    "Job Link", "Company Rating", "Company Size", "Skills Required",
-    "Comp Match", "Description", "Search Location", "Scraped On",
-]
-
-SEEN_HEADERS = ["URL", "Job Title", "Company", "Seen Date"]
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
+# ==============================================================
+#   GOOGLE SHEETS COLUMN LAYOUT
+#   Columns 1–23 follow the Sprint 1 document spec exactly.
+#   Columns 24–30 are extended metadata for multi-platform use.
+# ==============================================================
+
+JOBS_HEADERS = [
+    # ── Document-specified columns (Section 7, in order) ──────
+    "Job Title",                  # 1
+    "Company Name",               # 2
+    "Job URL",                    # 3
+    "LinkedIn Job ID",            # 4  extracted from URL
+    "Posted Date",                # 5
+    "Date Discovered",            # 6  today's date (run date)
+    "Remote Status",              # 7
+    "Employment Type",            # 8
+    "Engagement Type",            # 9  C2C / 1099 / W2 / Not mentioned
+    "Location",                   # 10
+    "Travel Required",            # 11 parsed from description
+    "Required Skills",            # 12
+    "Seniority Level",            # 13 from job_level field or title
+    "Experience Required (Yrs)",  # 14 extracted from description
+    "Technology Stack",           # 15 tech skills subset
+    "Match Score",                # 16 High / Medium / Low
+    "Why It Matches",             # 17 2-3 sentence plain-English summary
+    "Salary / Hourly Rate",       # 18
+    "Easy Apply",                 # 19 Unknown — not in Apify output
+    "Recruiter Name",             # 20 N/A  — not in Apify output
+    "Recruiter Profile URL",      # 21 N/A  — not in Apify output
+    "Status",                     # 22 New (default)
+    "Notes",                      # 23 flags for manual review
+    # ── Extended metadata (multi-platform) ────────────────────
+    "Platform",                   # 24
+    "Search Keyword",             # 25
+    "Comp Match",                 # 26 compensation rule that matched
+    "Company Rating",             # 27
+    "Company Size",               # 28
+    "Search Location",            # 29
+    "Scraped On",                 # 30 full timestamp
+]
+
+SEEN_HEADERS = ["URL", "Job Title", "Company", "Seen Date"]
+
 
 # ==============================================================
-#   GOOGLE SHEETS  — connection
+#   GOOGLE SHEETS — connection
 # ==============================================================
 
 def get_google_sheet():
-    """Authenticate with a service account and return the Spreadsheet object."""
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
     if not creds_json:
         raise EnvironmentError(
@@ -126,10 +119,8 @@ def get_google_sheet():
         )
     if not GOOGLE_SHEET_ID:
         raise EnvironmentError(
-            "GOOGLE_SHEET_ID is not set. "
-            "Copy the ID from your Google Sheet URL."
+            "GOOGLE_SHEET_ID is not set. Copy the ID from your Google Sheet URL."
         )
-
     creds = Credentials.from_service_account_info(
         json.loads(creds_json), scopes=GOOGLE_SCOPES
     )
@@ -137,61 +128,52 @@ def get_google_sheet():
     return gc.open_by_key(GOOGLE_SHEET_ID)
 
 
-def _get_or_create_tab(sh, title: str, rows: int = 10000, cols: int = 20):
-    """Return existing worksheet or create a new one."""
+def _get_or_create_tab(sh, title: str, rows: int = 10000, cols: int = 30):
     try:
         return sh.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
-        return ws
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 
 # ==============================================================
-#   GOOGLE SHEETS  — cross-run deduplication (Seen Jobs tab)
+#   GOOGLE SHEETS — cross-run deduplication (Seen Jobs tab)
 # ==============================================================
 
 def load_seen_jobs_from_sheet(sh) -> dict:
-    """
-    Read 'Seen Jobs' tab → dict {url: {title, company, seen_date}}.
-    Returns empty dict if the tab does not exist yet.
-    """
+    """Read 'Seen Jobs' tab → dict {url: {title, company, seen_date}}."""
     try:
-        ws  = sh.worksheet("Seen Jobs")
+        ws = sh.worksheet("Seen Jobs")
         all_vals = ws.get_all_values()
     except gspread.exceptions.WorksheetNotFound:
         return {}
 
-    if len(all_vals) <= 1:      # empty or header only
+    if len(all_vals) <= 1:
         return {}
 
-    headers  = all_vals[0]
-    url_i    = headers.index("URL")       if "URL"       in headers else 0
-    title_i  = headers.index("Job Title") if "Job Title" in headers else 1
-    co_i     = headers.index("Company")   if "Company"   in headers else 2
-    date_i   = headers.index("Seen Date") if "Seen Date" in headers else 3
+    headers = all_vals[0]
+    url_i   = headers.index("URL")       if "URL"       in headers else 0
+    title_i = headers.index("Job Title") if "Job Title" in headers else 1
+    co_i    = headers.index("Company")   if "Company"   in headers else 2
+    date_i  = headers.index("Seen Date") if "Seen Date" in headers else 3
 
     seen = {}
     for row in all_vals[1:]:
         if len(row) > url_i and row[url_i]:
             seen[row[url_i]] = {
-                "title"     : row[title_i]  if len(row) > title_i  else "",
-                "company"   : row[co_i]     if len(row) > co_i     else "",
-                "seen_date" : row[date_i]   if len(row) > date_i   else "",
+                "title"     : row[title_i] if len(row) > title_i else "",
+                "company"   : row[co_i]    if len(row) > co_i    else "",
+                "seen_date" : row[date_i]  if len(row) > date_i  else "",
             }
     return seen
 
 
 def update_seen_jobs_tab(sh, new_entries: dict):
-    """Append only the new entries added in this run to 'Seen Jobs' tab."""
+    """Append only entries added in this run to 'Seen Jobs' tab."""
     if not new_entries:
         return
-
     ws = _get_or_create_tab(sh, "Seen Jobs", rows=100_000, cols=4)
-
-    # Write header if tab is empty
-    if ws.row_count == 0 or not ws.cell(1, 1).value:
+    if not ws.cell(1, 1).value:
         ws.append_row(SEEN_HEADERS, value_input_option="USER_ENTERED")
-
     rows = [
         [url, info.get("title", ""), info.get("company", ""), info.get("seen_date", "")]
         for url, info in new_entries.items()
@@ -201,67 +183,67 @@ def update_seen_jobs_tab(sh, new_entries: dict):
 
 
 # ==============================================================
-#   GOOGLE SHEETS  — append new jobs to All Jobs tab
+#   GOOGLE SHEETS — append jobs
 # ==============================================================
 
 def append_jobs_to_sheet(sh, df: pd.DataFrame):
-    """Append today's filtered jobs to 'All Jobs' tab (never overwrites)."""
+    """Append today's qualified jobs to 'All Jobs' tab (never overwrites)."""
     ws = _get_or_create_tab(sh, "All Jobs", rows=100_000, cols=len(JOBS_HEADERS))
-
-    # Write header row if tab is blank
     if not ws.cell(1, 1).value:
         ws.append_row(JOBS_HEADERS, value_input_option="USER_ENTERED")
-
     rows = [
         [str(row.get(col, "")) for col in JOBS_HEADERS]
         for _, row in df.iterrows()
     ]
     if rows:
         ws.append_rows(rows, value_input_option="USER_ENTERED")
-
     print(f"  ✅ 'All Jobs' tab: {len(rows)} rows appended")
 
 
 # ==============================================================
-#   GOOGLE SHEETS  — summary tab (overwritten each run)
+#   GOOGLE SHEETS — summary tab (overwritten each run)
 # ==============================================================
 
 def update_summary_tab(sh, df: pd.DataFrame, filter_stats: dict, duration: int):
     """Overwrite 'Summary' tab with the latest run's stats."""
-    ws = _get_or_create_tab(sh, "Summary", rows=60, cols=4)
+    ws = _get_or_create_tab(sh, "Summary", rows=80, cols=4)
     ws.clear()
 
-    remote_count = (
-        df["Remote"].str.contains("Yes", na=False).sum()
-        if "Remote" in df.columns else 0
-    )
-    salary_count = (
-        (df["Salary"] != "Not Listed").sum()
-        if "Salary" in df.columns else 0
-    )
-    ft_count = (df["Job Type"].str.lower() == "fulltime").sum() if "Job Type" in df.columns else 0
-    ct_count = (df["Job Type"].str.lower() == "contract").sum() if "Job Type" in df.columns else 0
+    remote_c  = df["Remote Status"].str.contains("Remote", na=False).sum() if "Remote Status" in df.columns else 0
+    salary_c  = (df["Salary / Hourly Rate"] != "Not Listed").sum() if "Salary / Hourly Rate" in df.columns else 0
+    ft_c      = (df["Employment Type"].str.lower() == "fulltime").sum() if "Employment Type" in df.columns else 0
+    ct_c      = (df["Employment Type"].str.lower() == "contract").sum() if "Employment Type" in df.columns else 0
+    high_c    = (df["Match Score"] == "High").sum()   if "Match Score" in df.columns else 0
+    medium_c  = (df["Match Score"] == "Medium").sum() if "Match Score" in df.columns else 0
+    low_c     = (df["Match Score"] == "Low").sum()    if "Match Score" in df.columns else 0
 
     rows = [
         ["JOB HUNTING AI — LAST RUN SUMMARY", ""],
-        ["Run Date",              datetime.now().strftime("%Y-%m-%d %H:%M UTC")],
-        ["Duration (seconds)",    duration],
+        ["Run Date",           datetime.now().strftime("%Y-%m-%d %H:%M UTC")],
+        ["Duration (seconds)", duration],
         ["", ""],
         ["── FILTER BREAKDOWN ──", ""],
-        ["Not Remote (excluded)",       filter_stats["not_remote"]],
-        ["Irrelevant Title (excluded)", filter_stats["irrelevant_title"]],
-        ["Already Collected (skipped)", filter_stats["already_seen"]],
-        ["Low Experience (excluded)",   filter_stats["low_experience"]],
-        ["Low Salary (excluded)",       filter_stats["low_salary"]],
-        ["PASSED ALL FILTERS",          filter_stats["passed"]],
+        ["Not Remote / Hybrid (excluded)", filter_stats.get("not_remote", 0)],
+        ["Hybrid (excluded)",              filter_stats.get("hybrid", 0)],
+        ["Irrelevant Title (excluded)",    filter_stats.get("irrelevant_title", 0)],
+        ["Already Collected (skipped)",    filter_stats.get("already_seen", 0)],
+        ["Travel > 20% (excluded)",        filter_stats.get("travel", 0)],
+        ["Low Experience (excluded)",      filter_stats.get("low_experience", 0)],
+        ["Low / No Salary (excluded)",     filter_stats.get("low_salary", 0)],
+        ["PASSED ALL FILTERS",             filter_stats.get("passed", 0)],
+        ["", ""],
+        ["── MATCH SCORE BREAKDOWN ──", ""],
+        ["High",   high_c],
+        ["Medium", medium_c],
+        ["Low",    low_c],
         ["", ""],
         ["── THIS RUN RESULTS ──", ""],
-        ["Total Jobs Saved",       len(df)],
-        ["Remote Jobs",            remote_count],
-        ["Full-time Jobs",         ft_count],
-        ["Contract Jobs",          ct_count],
-        ["Jobs with Salary",       salary_count],
-        ["Unique Companies",       df["Company Name"].nunique() if "Company Name" in df.columns else 0],
+        ["Total Jobs Saved",    len(df)],
+        ["Remote Jobs",         remote_c],
+        ["Full-time Jobs",      ft_c],
+        ["Contract Jobs",       ct_c],
+        ["Jobs with Salary",    salary_c],
+        ["Unique Companies",    df["Company Name"].nunique() if "Company Name" in df.columns else 0],
     ]
 
     if "Platform" in df.columns:
@@ -276,6 +258,124 @@ def update_summary_tab(sh, df: pd.DataFrame, filter_stats: dict, duration: int):
 
     ws.update("A1", rows, value_input_option="USER_ENTERED")
     print("  ✅ 'Summary' tab updated")
+
+
+# ==============================================================
+#   HELPER: LinkedIn Job ID extraction
+# ==============================================================
+
+def extract_linkedin_job_id(url: str) -> str:
+    if not url:
+        return ""
+    m = re.search(r'linkedin\.com/jobs/view/(\d+)', url)
+    return m.group(1) if m else ""
+
+
+# ==============================================================
+#   HELPER: Seniority level
+# ==============================================================
+
+def extract_seniority(job: dict, title: str) -> str:
+    """Use structured job_level field first, then infer from title."""
+    level = (job.get("job_level") or "").strip()
+    if level:
+        return level
+
+    t = title.lower()
+    if any(w in t for w in ["vp ", "vice president", "head of", "executive"]):
+        return "Director / VP"
+    if any(w in t for w in ["director"]):
+        return "Director"
+    if any(w in t for w in ["principal", "staff"]):
+        return "Principal / Staff"
+    if any(w in t for w in ["manager", "lead"]):
+        return "Manager / Lead"
+    if any(w in t for w in ["architect"]):
+        return "Architect"
+    if any(w in t for w in ["senior", " sr ", " sr."]):
+        return "Senior"
+    if any(w in t for w in ["junior", " jr ", "entry", "associate"]):
+        return "Junior / Associate"
+    return "Mid-level"
+
+
+# ==============================================================
+#   HELPER: Engagement type detection (informational — not filtered)
+# ==============================================================
+
+def detect_engagement_type(desc: str) -> str:
+    """
+    Scans description for C2C, 1099, W2 mentions.
+    Result is stored in the Engagement Type column — not used to filter.
+    """
+    if not desc:
+        return "Not mentioned"
+
+    d = desc.lower()
+    found = []
+    if re.search(r'c2c|corp.{0,4}to.{0,4}corp|corp\s*2\s*corp', d):
+        found.append("C2C")
+    if "1099" in d:
+        found.append("1099")
+    if re.search(r'\bw-?2\b', d):
+        found.append("W2")
+
+    return ", ".join(found) if found else "Not mentioned"
+
+
+# ==============================================================
+#   HELPER: Travel requirement parsing
+# ==============================================================
+
+_TRAVEL_PCT_PATTERNS = [
+    r'(?:up\s+to\s+)?(\d+)\s*%\s*travel',
+    r'travel\s*(?:up\s*to|of|is|:|approximately|approx\.?)?\s*(\d+)\s*%',
+    r'(\d+)\s*%\s*(?:business\s+)?travel',
+]
+
+_VISIT_EXCEPTION_PATTERNS = [
+    r'(?:1|one)\s*(?:to|-)\s*(?:2|two)\s*(?:visits?|trips?|times?|days?)\s*(?:per|a|each)\s*month',
+    r'(?:2|two|twice)\s*(?:a|per|each)\s*month',
+    r'monthly\s*(?:office\s*)?(?:visit|check.?in)',
+    r'(?:occasional|rare|infrequent)\s*(?:office\s*)?(?:visit|presence)',
+]
+
+_NO_TRAVEL_PATTERNS = [
+    r'no\s+travel', r'travel\s+(?:not\s+)?(?:required|expected|necessary)',
+    r'(?:zero|0)\s*%\s*travel',
+]
+
+
+def _parse_travel(desc: str) -> tuple:
+    """
+    Returns (travel_pct, display_str).
+    travel_pct: int % if known, -1 if mentioned without %, -2 for visit exception, None if not mentioned.
+    """
+    if not desc:
+        return None, "Not mentioned"
+
+    d = desc.lower()
+
+    # Explicit no-travel statement
+    if any(re.search(p, d) for p in _NO_TRAVEL_PATTERNS):
+        return 0, "None required"
+
+    # Percentage found
+    for pattern in _TRAVEL_PCT_PATTERNS:
+        m = re.search(pattern, d)
+        if m:
+            pct = int(m.group(1))
+            return pct, f"{pct}%"
+
+    # Visit exception (1-2 times/month)
+    if any(re.search(p, d) for p in _VISIT_EXCEPTION_PATTERNS):
+        return -2, "1-2 visits/month"
+
+    # Travel mentioned but no percentage
+    if re.search(r'\btravel\b', d):
+        return -1, "Mentioned (% not specified)"
+
+    return None, "Not mentioned"
 
 
 # ==============================================================
@@ -295,13 +395,8 @@ _EXP_PATTERNS = [
 
 
 def extract_min_experience(text: str):
-    """
-    Returns the minimum years of experience explicitly required,
-    or None if no requirement is found in the text.
-    """
     if not text:
         return None
-
     t = text.lower()
     found = []
     for pattern in _EXP_PATTERNS:
@@ -312,7 +407,6 @@ def extract_min_experience(text: str):
                     found.append(val)
             except (ValueError, TypeError):
                 pass
-
     return min(found) if found else None
 
 
@@ -323,12 +417,8 @@ def extract_min_experience(text: str):
 def check_compensation(job: dict) -> tuple:
     """
     Returns (passes: bool, reason: str).
-
-    Criteria — at least ONE must match:
-      A) Hourly rate range overlaps [$HOURLY_MIN, $HOURLY_MAX]
-      B) Annual salary >= $ANNUAL_MIN
-
-    Jobs with no salary listed use INCLUDE_NO_SALARY setting.
+    At least ONE must match: hourly $HOURLY_MIN–$HOURLY_MAX OR annual >= $ANNUAL_MIN.
+    Jobs with no salary listed follow INCLUDE_NO_SALARY.
     """
     s_min    = job.get("salary_min") or job.get("min_amount")
     s_max    = job.get("salary_max") or job.get("max_amount")
@@ -349,29 +439,27 @@ def check_compensation(job: dict) -> tuple:
 
     if interval in ("hour", "hourly", "hr"):
         if lo <= HOURLY_MAX and hi >= HOURLY_MIN:
-            return True, f"Hourly ${lo:.0f}-${hi:.0f}/hr in target range"
-        return False, f"Hourly ${lo:.0f}-${hi:.0f}/hr outside ${HOURLY_MIN}-${HOURLY_MAX}"
+            return True, f"Hourly ${lo:.0f}–${hi:.0f}/hr in target range"
+        return False, f"Hourly ${lo:.0f}–${hi:.0f}/hr outside ${HOURLY_MIN}–${HOURLY_MAX}"
 
     if interval in ("year", "annual", "yearly", "annually"):
         if lo >= ANNUAL_MIN:
             return True, f"Annual ${lo:,.0f} >= ${ANNUAL_MIN:,}"
         if hi >= ANNUAL_MIN:
-            # min is below threshold but max meets it (e.g. $140K-$160K)
-            return True, f"Annual range ${lo:,.0f}-${hi:,.0f} (max >= ${ANNUAL_MIN:,})"
-        return False, f"Annual ${lo:,.0f}-${hi:,.0f} both < ${ANNUAL_MIN:,}"
+            return True, f"Annual range ${lo:,.0f}–${hi:,.0f} (max >= ${ANNUAL_MIN:,})"
+        return False, f"Annual ${lo:,.0f}–${hi:,.0f} both < ${ANNUAL_MIN:,}"
 
-    # Infer interval from magnitude
     if lo > 1_000:
         if lo >= ANNUAL_MIN:
             return True, f"~Annual ${lo:,.0f} >= ${ANNUAL_MIN:,}"
         if hi >= ANNUAL_MIN:
-            return True, f"~Annual range ${lo:,.0f}-${hi:,.0f} (max >= ${ANNUAL_MIN:,})"
-        return False, f"~Annual ${lo:,.0f}-${hi:,.0f} both < ${ANNUAL_MIN:,}"
+            return True, f"~Annual range ${lo:,.0f}–${hi:,.0f} (max >= ${ANNUAL_MIN:,})"
+        return False, f"~Annual ${lo:,.0f}–${hi:,.0f} both < ${ANNUAL_MIN:,}"
 
     if lo <= 200:
         if lo <= HOURLY_MAX and hi >= HOURLY_MIN:
-            return True, f"~Hourly ${lo:.0f}-${hi:.0f}/hr in target range"
-        return False, f"~Hourly ${lo:.0f}-${hi:.0f}/hr outside target range"
+            return True, f"~Hourly ${lo:.0f}–${hi:.0f}/hr in target range"
+        return False, f"~Hourly ${lo:.0f}–${hi:.0f}/hr outside target range"
 
     return True, "Ambiguous salary (included)"
 
@@ -384,75 +472,93 @@ def is_relevant_title(title: str) -> tuple:
     """Returns (relevant: bool, reason: str)."""
     t = title.lower()
 
+    # Check exclusion phrases FIRST (full phrases — no bare "marketing")
     for term in EXCLUDED_TITLE_TERMS:
         if term in t:
-            return False, f"Excluded title keyword: '{term}'"
+            return False, f"Excluded title phrase: '{term}'"
 
+    # Must contain at least one Salesforce-related term
     for term in REQUIRED_TITLE_TERMS:
         if term in t:
-            return True, f"Salesforce title keyword: '{term}'"
+            return True, f"Salesforce title term: '{term}'"
 
     return False, "No Salesforce-related title keyword found"
 
 
 # ==============================================================
-#   MASTER FILTER
+#   REMOTE + HYBRID DETECTION
 # ==============================================================
 
-# Broad location strings that indicate remote (no specific city)
 _REMOTE_LOCATIONS = {
     "united states", "usa", "us", "remote", "anywhere", "nationwide",
     "work from home", "wfh", "north america", "remote us", "remote usa",
 }
 
-# Description phrases that confirm a position is remote
 _REMOTE_DESC_PHRASES = [
     "fully remote", "100% remote", "remote position", "work remotely",
     "work from home", "remote-first", "remote work", "remote worker",
     "this is a remote", "position is remote", "role is remote",
 ]
 
+# Phrases that definitively indicate a hybrid (not fully-remote) arrangement
+_HYBRID_DEFINITIVE = [
+    "hybrid work schedule", "hybrid work model", "hybrid work arrangement",
+    "hybrid schedule", "hybrid position", "hybrid role", "hybrid setting",
+    "days per week in office", "days per week on-site",
+    "days in the office per week", "days on site per week",
+    "days in office per week", "in-office days required",
+    "office presence required", "required to work on-site",
+    "required to be in office", "partially remote", "part-time remote",
+    "split between office and remote",
+]
 
-def _is_effectively_remote(job: dict) -> bool:
-    """
-    Returns True when a job is remote, using three signals:
-      1. Structured is_remote field (most reliable)
-      2. Location string is broad / country-level (no city or state)
-      3. Description contains explicit remote-work phrases
 
-    LinkedIn in particular often omits is_remote=True for jobs that appear
-    in remote searches but use "United States" as the location field.
+def _is_effectively_remote(job: dict) -> tuple:
     """
+    Returns (is_remote: bool, work_type: str).
+    Trusts structured is_remote field; for untagged jobs infers from
+    location breadth and description phrases.
+    Rejects definitive hybrid-only arrangements.
+    """
+    # Trust structured field from job board
     if job.get("is_remote", False):
-        return True
+        return True, "Remote"
 
-    location = (job.get("location") or
-                job.get("city") or "").strip().lower()
+    desc = (job.get("description", "") or "").lower()
+
+    # Check for definitive hybrid phrases before accepting as remote
+    if any(phrase in desc for phrase in _HYBRID_DEFINITIVE):
+        return False, "Hybrid"
+
+    # Infer remote from broad location (no specific city)
+    location = (job.get("location") or job.get("city") or "").strip().lower()
     if location in _REMOTE_LOCATIONS:
-        return True
+        return True, "Remote (inferred: broad location)"
 
-    # If city and state are both empty, the job has no specific location
     city  = (job.get("city",  "") or "").strip()
     state = (job.get("state", "") or "").strip()
     if not city and not state:
-        return True
+        return True, "Remote (inferred: no location specified)"
 
-    desc = (job.get("description", "") or "").lower()
+    # Description has explicit remote language
     if any(phrase in desc for phrase in _REMOTE_DESC_PHRASES):
-        return True
+        return True, "Remote (inferred: description)"
 
-    return False
+    return False, "On-site / Unknown"
 
+
+# ==============================================================
+#   MASTER FILTER  (remote · title · dedup · experience · compensation)
+#   Travel is handled separately in main() to capture Notes flags.
+# ==============================================================
 
 def filter_job(job: dict, seen: dict) -> tuple:
-    """
-    Returns (keep: bool, reason: str).
-    All five checks must pass; first failure short-circuits.
-    """
+    """Returns (keep: bool, reason: str)."""
 
-    # 1. Remote
-    if not _is_effectively_remote(job):
-        return False, "Not remote"
+    # 1. Remote + hybrid check
+    is_remote, work_type = _is_effectively_remote(job)
+    if not is_remote:
+        return False, f"Not remote ({work_type})"
 
     # 2. Title relevance
     title_ok, title_reason = is_relevant_title(job.get("title", ""))
@@ -460,11 +566,7 @@ def filter_job(job: dict, seen: dict) -> tuple:
         return False, title_reason
 
     # 3. Cross-run deduplication
-    url = (
-        job.get("job_url_direct") or
-        job.get("job_url") or
-        job.get("url") or ""
-    )
+    url = (job.get("job_url_direct") or job.get("job_url") or job.get("url") or "")
     if url and url in seen:
         prev_date = seen[url].get("seen_date", "?")
         return False, f"Already collected on {prev_date}"
@@ -484,13 +586,148 @@ def filter_job(job: dict, seen: dict) -> tuple:
 
 
 # ==============================================================
+#   MATCH SCORING  (High / Medium / Low)
+# ==============================================================
+
+def score_job(raw_job: dict, cleaned: dict) -> tuple:
+    """
+    Returns (score: str, why_matches: str, score_notes: str).
+
+    Scoring factors (per Sprint 1 document Section 5):
+      +3  Title exactly/closely matches ICP target
+      +1  Title is Salesforce-related (partial match)
+      +2  Strong skills overlap (≥ 4 ICP skills in description)
+      +1  Partial skills overlap (1–3 ICP skills)
+      +2  Seniority matches ICP targets (Senior/Lead/Manager/Architect)
+      -1  Seniority below ICP target (Junior/Entry)
+      +1  Posted within past 24 hours
+      +1  C2C or 1099 explicitly mentioned
+      +1  Salary / rate listed in posting
+      -1  Travel of any kind mentioned
+
+    Tiers:  High ≥ 6  |  Medium 3–5  |  Low ≤ 2
+    """
+    points       = 0
+    boost        = []   # reasons that increased score
+    deductions   = []   # reasons that decreased score
+    score_notes  = []   # flags for Notes column
+
+    title     = (cleaned.get("Job Title", "") or "").lower()
+    desc      = (raw_job.get("description", "") or "").lower()
+    skills_t  = (cleaned.get("Required Skills", "") or "").lower()
+    seniority = (cleaned.get("Seniority Level", "") or "").lower()
+    salary    = (cleaned.get("Salary / Hourly Rate", "") or "")
+    travel    = (cleaned.get("Travel Required", "") or "")
+    date_str  = (cleaned.get("Posted Date", "") or "")
+    search_kw = (cleaned.get("Search Keyword", "") or "").lower()
+
+    # Combine description + skills for skill matching
+    full_text = desc + " " + skills_t
+
+    # ── 1. Title match ─────────────────────────────────────────
+    icp_titles = [t.lower() for t in ICP["job_titles"]]
+    if any(icp_t in title or title in icp_t for icp_t in icp_titles) or \
+       any(icp_t in search_kw for icp_t in icp_titles):
+        points += 3
+        boost.append("title closely matches ICP target")
+    elif any(term in title for term in [t.lower() for t in REQUIRED_TITLE_TERMS]):
+        points += 1
+        boost.append("title is Salesforce-related")
+
+    # ── 2. Skills overlap ──────────────────────────────────────
+    icp_skills = [s.lower() for s in ICP["skills"]]
+    matched    = [s for s in icp_skills if s in full_text]
+    if len(matched) >= 4:
+        points += 2
+        boost.append(f"strong skills alignment ({len(matched)} ICP skills: {', '.join(matched[:5])})")
+    elif matched:
+        points += 1
+        boost.append(f"partial skills overlap ({', '.join(matched[:3])})")
+
+    # ── 3. Seniority match ─────────────────────────────────────
+    seniority_targets = [s.lower() for s in ICP["seniority_targets"]]
+    if any(s in title for s in seniority_targets) or \
+       any(s in seniority for s in seniority_targets):
+        points += 2
+        boost.append("seniority level matches ICP (Senior / Lead / Manager / Architect)")
+    elif any(w in title for w in ["junior", " jr ", "entry", "associate"]):
+        points -= 1
+        deductions.append("seniority appears below ICP target")
+
+    # ── 4. Freshness ───────────────────────────────────────────
+    try:
+        posted_dt   = pd.to_datetime(date_str)
+        hours_since = (datetime.now() - posted_dt.replace(tzinfo=None)).total_seconds() / 3600
+        if hours_since <= 24:
+            points += 1
+            boost.append("posted within the past 24 hours")
+    except Exception:
+        pass
+
+    # ── 5. C2C / 1099 explicitly mentioned ────────────────────
+    if re.search(r'c2c|corp.{0,4}to.{0,4}corp|1099', desc):
+        points += 1
+        boost.append("C2C or 1099 explicitly mentioned")
+
+    # ── 6. Compensation listed ─────────────────────────────────
+    if salary and salary != "Not Listed":
+        points += 1
+        boost.append("compensation rate listed in posting")
+    else:
+        score_notes.append("Salary / Rate Not Confirmed")
+
+    # ── 7. Travel penalty ──────────────────────────────────────
+    if travel and "not mentioned" not in travel.lower() and "none" not in travel.lower():
+        points -= 1
+        deductions.append(f"travel mentioned ({travel})")
+
+    # ── Determine tier ─────────────────────────────────────────
+    if points >= 6:
+        score = "High"
+    elif points >= 3:
+        score = "Medium"
+    else:
+        score = "Low"
+
+    # ── Generate "Why It Matches" (2–3 sentences) ─────────────
+    company  = cleaned.get("Company Name", "this company")
+    job_type = cleaned.get("Employment Type", "role")
+
+    sentences = []
+
+    # Sentence 1: Primary alignment reason
+    if boost:
+        primary = boost[0]
+        secondary = f" and {boost[1]}" if len(boost) > 1 else ""
+        sentences.append(
+            f'This {job_type} role at {company} aligns with the ICP — {primary}{secondary}.'
+        )
+
+    # Sentence 2: Additional factors
+    extra = boost[2:] + deductions
+    if extra:
+        sentences.append(f"Additional factors: {'; '.join(extra[:3])}.")
+
+    # Sentence 3: Priority summary
+    priority_text = {
+        "High"  : "high-priority opportunity — review promptly.",
+        "Medium": "reasonable ICP alignment — worth reviewing.",
+        "Low"   : "weak ICP alignment — lower priority.",
+    }
+    sentences.append(f"Overall this is a {priority_text[score]}")
+
+    why_matches = " ".join(sentences[:3])
+
+    return score, why_matches, "; ".join(score_notes)
+
+
+# ==============================================================
 #   FETCH JOBS FROM APIFY
 # ==============================================================
 
 def fetch_jobs_from_apify(keyword: str, location: str, job_type: str) -> list:
     """Calls Apify openclawai/job-board-scraper; returns raw job list."""
     client = ApifyClient(APIFY_API_TOKEN)
-
     print(f"\n  🔍 '{keyword}' | 📍 {location} | 💼 {job_type}")
 
     run_input = {
@@ -502,7 +739,7 @@ def fetch_jobs_from_apify(keyword: str, location: str, job_type: str) -> list:
         "isRemote"            : True,
         "jobType"             : job_type,
         "countryIndeed"       : COUNTRY_INDEED,
-        "enforceAnnualSalary" : False,   # keep original interval for salary check
+        "enforceAnnualSalary" : False,
         "descriptionFormat"   : "markdown",
     }
 
@@ -511,7 +748,6 @@ def fetch_jobs_from_apify(keyword: str, location: str, job_type: str) -> list:
             run_input=run_input,
             wait_duration=timedelta(minutes=10),
         )
-
         if not run:
             print("  ⚠️  Run returned no data")
             return []
@@ -521,7 +757,6 @@ def fetch_jobs_from_apify(keyword: str, location: str, job_type: str) -> list:
             if isinstance(run, dict)
             else run.default_dataset_id
         )
-
         jobs = list(client.dataset(dataset_id).iterate_items())
         print(f"  ✅ {len(jobs)} raw jobs returned")
         return jobs
@@ -532,12 +767,46 @@ def fetch_jobs_from_apify(keyword: str, location: str, job_type: str) -> list:
 
 
 # ==============================================================
-#   CLEAN / NORMALIZE A SINGLE JOB
+#   CLEAN / NORMALIZE A SINGLE JOB  (produces all 30 columns)
 # ==============================================================
 
-def clean_job(job: dict, keyword: str, location: str,
-              job_type: str, match_info: str = "") -> dict:
-    """Extracts and normalises fields from a raw Apify job dict."""
+def clean_job(job: dict, keyword: str, location: str, job_type: str,
+              comp_match: str = "", travel_str: str = "Not mentioned",
+              initial_notes: str = "") -> dict:
+    """Maps a raw Apify job dict to the full 30-column output schema."""
+
+    # ── Core fields ─────────────────────────────────────────────
+    title = job.get("title", "")
+    desc  = job.get("description", "") or ""
+
+    # ── Apply link + LinkedIn Job ID ────────────────────────────
+    apply_link = (
+        job.get("job_url_direct") or
+        job.get("job_url") or
+        job.get("url") or "N/A"
+    )
+    linkedin_id = extract_linkedin_job_id(apply_link)
+
+    # ── Location ────────────────────────────────────────────────
+    parts = filter(None, [job.get("city", ""), job.get("state", ""),
+                           job.get("country", "")])
+    loc = ", ".join(parts) or job.get("location", location)
+
+    # ── Remote status ───────────────────────────────────────────
+    _, work_type = _is_effectively_remote(job)
+    remote_status = work_type if work_type else ("Remote" if job.get("is_remote") else "Unknown")
+
+    # ── Dates ────────────────────────────────────────────────────
+    date_raw = job.get("date_posted", "")
+    if date_raw:
+        try:
+            date_posted = pd.to_datetime(str(date_raw)).strftime("%Y-%m-%d")
+        except Exception:
+            date_posted = str(date_raw)[:10]
+    else:
+        date_posted = "Unknown"
+
+    today = datetime.now().strftime("%Y-%m-%d")
 
     # ── Salary display ──────────────────────────────────────────
     s_min = job.get("salary_min") or job.get("min_amount")
@@ -547,7 +816,7 @@ def clean_job(job: dict, keyword: str, location: str,
 
     if s_min and s_max:
         try:
-            salary = f"${float(s_min):,.0f} - ${float(s_max):,.0f} {s_cur}/{s_int}"
+            salary = f"${float(s_min):,.0f} – ${float(s_max):,.0f} {s_cur}/{s_int}"
         except Exception:
             salary = "Not Listed"
     elif s_min:
@@ -558,58 +827,66 @@ def clean_job(job: dict, keyword: str, location: str,
     else:
         salary = "Not Listed"
 
-    # ── Location ────────────────────────────────────────────────
-    parts = filter(None, [job.get("city", ""), job.get("state", ""),
-                           job.get("country", "")])
-    loc = ", ".join(parts) or job.get("location", location)
+    # ── Seniority ────────────────────────────────────────────────
+    seniority = extract_seniority(job, title)
 
-    # ── Remote ──────────────────────────────────────────────────
-    remote = "Yes" if job.get("is_remote", False) else "No"
+    # ── Experience years ─────────────────────────────────────────
+    exp_years = extract_min_experience(desc)
+    exp_str   = f"{exp_years}+" if exp_years else "Not specified"
 
-    # ── Date posted ─────────────────────────────────────────────
-    date_raw = job.get("date_posted", "")
-    if date_raw:
-        try:
-            date_posted = pd.to_datetime(str(date_raw)).strftime("%Y-%m-%d")
-        except Exception:
-            date_posted = str(date_raw)[:10]
-    else:
-        date_posted = "Unknown"
-
-    # ── Apply link ──────────────────────────────────────────────
-    apply_link = (
-        job.get("job_url_direct") or
-        job.get("job_url") or
-        job.get("url") or "N/A"
-    )
-
-    # ── Description (truncated) ─────────────────────────────────
-    desc = job.get("description", "") or ""
-    desc_short = desc[:400] + "..." if len(desc) > 400 else desc
-
-    # ── Skills ──────────────────────────────────────────────────
+    # ── Skills and Technology Stack ──────────────────────────────
     skills = job.get("skills") or []
-    skills_str = ", ".join(skills[:10]) if isinstance(skills, list) else str(skills)
+    skills_str = ", ".join(skills[:15]) if isinstance(skills, list) else str(skills)
+
+    # Tech stack = ICP skills found in description + skills list
+    combined = (skills_str + " " + desc).lower()
+    icp_skills_found = [s for s in ICP["skills"] if s in combined]
+    tech_stack = ", ".join(icp_skills_found) if icp_skills_found else skills_str[:200]
+
+    # ── Engagement type (informational) ─────────────────────────
+    engagement_type = detect_engagement_type(desc)
+
+    # ── Notes (initial flags before scoring) ─────────────────────
+    notes_parts = list(filter(None, [initial_notes]))
+    if engagement_type == "Not mentioned":
+        notes_parts.append("Engagement Type Not Confirmed")
+    if salary == "Not Listed":
+        notes_parts.append("Salary / Rate Not Confirmed")
 
     return {
-        "Search Keyword"   : keyword,
-        "Platform"         : str(job.get("site", "")).capitalize(),
-        "Job Title"        : job.get("title", ""),
-        "Company Name"     : job.get("company", ""),
-        "Location"         : loc,
-        "Remote"           : remote,
-        "Job Type"         : job_type.capitalize(),
-        "Salary"           : salary,
-        "Date Posted"      : date_posted,
-        "Job Link"         : apply_link,
-        "Company Rating"   : str(job.get("company_rating", "")),
-        "Company Size"     : str(job.get("company_employees_label") or
-                                 job.get("company_num_employees") or ""),
-        "Skills Required"  : skills_str,
-        "Comp Match"       : match_info,
-        "Description"      : desc_short,
-        "Search Location"  : location,
-        "Scraped On"       : datetime.now().strftime("%Y-%m-%d %H:%M"),
+        # Document columns 1–23
+        "Job Title"              : title,
+        "Company Name"           : job.get("company", ""),
+        "Job URL"                : apply_link,
+        "LinkedIn Job ID"        : linkedin_id,
+        "Posted Date"            : date_posted,
+        "Date Discovered"        : today,
+        "Remote Status"          : remote_status,
+        "Employment Type"        : job_type.capitalize(),
+        "Engagement Type"        : engagement_type,
+        "Location"               : loc,
+        "Travel Required"        : travel_str,
+        "Required Skills"        : skills_str,
+        "Seniority Level"        : seniority,
+        "Experience Required (Yrs)": exp_str,
+        "Technology Stack"       : tech_stack,
+        "Match Score"            : "",          # filled after score_job()
+        "Why It Matches"         : "",          # filled after score_job()
+        "Salary / Hourly Rate"   : salary,
+        "Easy Apply"             : "Unknown",   # not available from Apify output
+        "Recruiter Name"         : "N/A",       # not available from Apify output
+        "Recruiter Profile URL"  : "N/A",       # not available from Apify output
+        "Status"                 : "New",
+        "Notes"                  : "; ".join(notes_parts),
+        # Extended metadata columns 24–30
+        "Platform"               : str(job.get("site", "")).capitalize(),
+        "Search Keyword"         : keyword,
+        "Comp Match"             : comp_match,
+        "Company Rating"         : str(job.get("company_rating", "")),
+        "Company Size"           : str(job.get("company_employees_label") or
+                                       job.get("company_num_employees") or ""),
+        "Search Location"        : location,
+        "Scraped On"             : datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
 
 
@@ -618,12 +895,11 @@ def clean_job(job: dict, keyword: str, location: str,
 # ==============================================================
 
 def main():
-    start_time = datetime.now()
-
+    start_time     = datetime.now()
     total_searches = len(SEARCH_KEYWORDS) * len(LOCATIONS) * len(JOB_TYPES)
 
     print("=" * 62)
-    print("   🤖  JOB HUNTING AI AUTOMATION TOOL  v3.0")
+    print("   🤖  JOB HUNTING AI AUTOMATION TOOL  v4.0")
     print("=" * 62)
     print(f"  📋 Platforms  : {', '.join(SITES)}")
     print(f"  🔑 Keywords   : {len(SEARCH_KEYWORDS)}")
@@ -631,18 +907,18 @@ def main():
     print(f"  💼 Job Types  : {', '.join(JOB_TYPES)}")
     print(f"  ⏰ Posted In  : Last {HOURS_OLD} hours")
     print(f"  🎯 Min Exp    : {MIN_EXP_YEARS}+ years")
-    print(f"  💰 Salary     : ${HOURLY_MIN}-${HOURLY_MAX}/hr  OR  "
-          f"${ANNUAL_MIN/1000:.0f}K+/yr")
+    print(f"  ✈️  Max Travel : {MAX_TRAVEL_PCT}%")
+    print(f"  💰 Salary     : ${HOURLY_MIN}–${HOURLY_MAX}/hr  OR  ${ANNUAL_MIN/1000:.0f}K+/yr")
     print(f"  🔍 API Calls  : {total_searches}")
     print("=" * 62)
 
-    # ── Connect to Google Sheets (fail fast) ────────────────────
+    # ── Connect to Google Sheets ────────────────────────────────
     print("\n  🔗 Connecting to Google Sheets…")
     sh   = get_google_sheet()
     seen = load_seen_jobs_from_sheet(sh)
-    print(f"  📦 Previously seen : {len(seen)} jobs (loaded from Seen Jobs tab)")
+    print(f"  📦 Previously seen : {len(seen)} jobs (cross-run dedup loaded)")
 
-    # ── Fetch all jobs ──────────────────────────────────────────
+    # ── Fetch all raw jobs ──────────────────────────────────────
     all_raw: list = []
     call_count    = 0
 
@@ -651,14 +927,12 @@ def main():
             for job_type in JOB_TYPES:
                 call_count += 1
                 print(f"\n  [{call_count}/{total_searches}]", end="")
-
                 raw = fetch_jobs_from_apify(keyword, location, job_type)
                 for job in raw:
                     job["_kw"]   = keyword
                     job["_loc"]  = location
                     job["_type"] = job_type
                 all_raw.extend(raw)
-
                 if call_count < total_searches:
                     time.sleep(3)
 
@@ -666,65 +940,97 @@ def main():
     print(f"  📦 Total raw jobs collected : {len(all_raw)}")
 
     if not all_raw:
-        print("\n  ⚠️  No jobs found. Check API token and keywords.")
+        print("\n  ⚠️  No jobs found. Check your API token and keywords.")
         return
 
-    # ── Apply all filters ───────────────────────────────────────
-    print("  🔍 Applying AI filters…")
+    # ── Apply filters + scoring ─────────────────────────────────
+    print("  🔍 Applying filters and scoring…")
 
     filter_stats = dict(
-        not_remote=0, irrelevant_title=0, already_seen=0,
-        low_experience=0, low_salary=0, passed=0,
+        not_remote=0, hybrid=0, irrelevant_title=0, already_seen=0,
+        travel=0, low_experience=0, low_salary=0, passed=0,
     )
-    filtered    = []
-    new_seen    = {}     # only entries added in this run → written to Seen Jobs tab
-    today       = datetime.now().strftime("%Y-%m-%d")
+    filtered = []
+    new_seen = {}
+    today    = datetime.now().strftime("%Y-%m-%d")
 
     for job in all_raw:
         kw  = job.pop("_kw",   "Unknown")
         loc = job.pop("_loc",  "Unknown")
         jt  = job.pop("_type", "Unknown")
 
+        # ── Core filters ──────────────────────────────────────
         keep, reason = filter_job(job, seen)
 
         if not keep:
-            if   "Not remote" in reason:  filter_stats["not_remote"]      += 1
-            elif "keyword"    in reason:  filter_stats["irrelevant_title"] += 1
-            elif "Already"    in reason:  filter_stats["already_seen"]    += 1
-            elif "yr"         in reason:  filter_stats["low_experience"]   += 1
-            elif "$"          in reason:  filter_stats["low_salary"]       += 1
+            r = reason.lower()
+            if   "hybrid"    in r: filter_stats["hybrid"]          += 1
+            elif "not remote" in r: filter_stats["not_remote"]     += 1
+            elif "keyword"   in r or "salesforce" in r or "title" in r:
+                                    filter_stats["irrelevant_title"] += 1
+            elif "already"   in r: filter_stats["already_seen"]    += 1
+            elif "yr"        in r: filter_stats["low_experience"]   += 1
+            elif "$"         in r: filter_stats["low_salary"]       += 1
             continue
 
-        filter_stats["passed"] += 1
-        cleaned = clean_job(job, kw, loc, jt, reason)
+        # ── Travel check (separate — needs Notes flag on partial fail) ──
+        desc = job.get("description", "") or ""
+        travel_pct, travel_str = _parse_travel(desc)
+        travel_notes = ""
 
-        url = cleaned.get("Job Link", "")
+        if travel_pct is not None and travel_pct not in (-1, -2):
+            if travel_pct > MAX_TRAVEL_PCT:
+                filter_stats["travel"] += 1
+                continue                           # hard reject
+        elif travel_pct == -1:
+            travel_notes = "Travel percentage not specified — manual review needed"
+        elif travel_pct == -2:
+            travel_notes = "Visit exception: 1–2 visits/month — verify rate at $80+/hr"
+
+        # ── Clean + score ─────────────────────────────────────
+        filter_stats["passed"] += 1
+        cleaned = clean_job(job, kw, loc, jt, reason, travel_str, travel_notes)
+
+        score, why_matches, score_notes = score_job(job, cleaned)
+        cleaned["Match Score"]    = score
+        cleaned["Why It Matches"] = why_matches
+
+        # Merge all Notes flags
+        existing_notes = cleaned.get("Notes", "")
+        all_notes = "; ".join(filter(None, [existing_notes, score_notes]))
+        cleaned["Notes"] = all_notes
+
+        # ── Register in seen (cross-run + within-run dedup) ──
+        url = cleaned.get("Job URL", "")
         if url and url != "N/A":
             entry = {
                 "title"     : cleaned["Job Title"],
                 "company"   : cleaned["Company Name"],
                 "seen_date" : today,
             }
-            seen[url]     = entry   # prevent duplicates within this run
-            new_seen[url] = entry   # track what to write to sheet
+            seen[url]     = entry
+            new_seen[url] = entry
 
         filtered.append(cleaned)
 
+    # ── Stats ────────────────────────────────────────────────────
     print(f"\n  📊 Filter Breakdown:")
-    print(f"     Not remote        : {filter_stats['not_remote']}")
-    print(f"     Irrelevant title  : {filter_stats['irrelevant_title']}")
-    print(f"     Already collected : {filter_stats['already_seen']}")
-    print(f"     Low experience    : {filter_stats['low_experience']}")
-    print(f"     Low / no salary   : {filter_stats['low_salary']}")
-    print(f"     ✅ PASSED ALL      : {filter_stats['passed']}")
+    print(f"     Not remote           : {filter_stats['not_remote']}")
+    print(f"     Hybrid (rejected)    : {filter_stats['hybrid']}")
+    print(f"     Irrelevant title     : {filter_stats['irrelevant_title']}")
+    print(f"     Already collected    : {filter_stats['already_seen']}")
+    print(f"     Travel > {MAX_TRAVEL_PCT}%       : {filter_stats['travel']}")
+    print(f"     Low experience       : {filter_stats['low_experience']}")
+    print(f"     Low / no salary      : {filter_stats['low_salary']}")
+    print(f"     ✅ PASSED ALL         : {filter_stats['passed']}")
 
     if not filtered:
-        print("\n  ⚠️  No jobs passed all filters. Try relaxing thresholds.")
+        print("\n  ⚠️  No jobs passed all filters.")
         return
 
     df = pd.DataFrame(filtered)
 
-    # Remove same-run duplicates
+    # ── Within-run deduplication ─────────────────────────────────
     before = len(df)
     df.drop_duplicates(
         subset=["Job Title", "Company Name", "Platform"],
@@ -735,31 +1041,45 @@ def main():
     if removed:
         print(f"  🧹 Removed {removed} within-run duplicates")
 
-    df.sort_values("Date Posted", ascending=False, inplace=True)
+    # ── Sort: High → Medium → Low → newest date → C2C mention ──
+    score_rank = {"High": 0, "Medium": 1, "Low": 2}
+    df["_sr"] = df["Match Score"].map(score_rank).fillna(3)
+    df["_c2c"] = df["Engagement Type"].str.contains(
+        "C2C|1099", na=False, case=False, regex=True
+    ).map({True: 0, False: 1})
+    df.sort_values(
+        by=["_sr", "Posted Date", "_c2c"],
+        ascending=[True, False, True],
+        inplace=True,
+    )
+    df.drop(columns=["_sr", "_c2c"], inplace=True)
     df.reset_index(drop=True, inplace=True)
-    print(f"  ✅ Final unique jobs : {len(df)}")
 
-    # ── Write to Google Sheets ──────────────────────────────────
+    print(f"  ✅ Final unique jobs : {len(df)}")
+    if "Match Score" in df.columns:
+        h = (df["Match Score"] == "High").sum()
+        m = (df["Match Score"] == "Medium").sum()
+        lo = (df["Match Score"] == "Low").sum()
+        print(f"     High: {h}  |  Medium: {m}  |  Low: {lo}")
+
+    # ── Write to Google Sheets ────────────────────────────────────
     print("\n  📤 Writing to Google Sheets…")
     append_jobs_to_sheet(sh, df)
     update_seen_jobs_tab(sh, new_seen)
     update_summary_tab(sh, df, filter_stats,
                        (datetime.now() - start_time).seconds)
 
-    # ── Final summary ───────────────────────────────────────────
+    # ── Final console summary ─────────────────────────────────────
     duration = (datetime.now() - start_time).seconds
     print(f"\n{'=' * 62}")
     print(f"  ✅ COMPLETED in {duration}s")
-    print(f"  📊 Google Sheet ID   : {GOOGLE_SHEET_ID}")
-    print(f"  🎯 Jobs appended     : {len(df)}")
-    print(f"  🔄 Seen jobs total   : {len(seen)}")
+    print(f"  📊 Google Sheet ID    : {GOOGLE_SHEET_ID}")
+    print(f"  🎯 Jobs appended      : {len(df)}")
+    print(f"  🔄 Seen jobs total    : {len(seen)}")
 
-    if "Remote" in df.columns:
-        print(f"  🏠 Remote jobs       : {df['Remote'].str.contains('Yes', na=False).sum()}")
-
-    if "Job Type" in df.columns:
-        ft = (df["Job Type"].str.lower() == "fulltime").sum()
-        ct = (df["Job Type"].str.lower() == "contract").sum()
+    if "Employment Type" in df.columns:
+        ft = (df["Employment Type"].str.lower() == "fulltime").sum()
+        ct = (df["Employment Type"].str.lower() == "contract").sum()
         print(f"  💼 Full-time / Contract : {ft} / {ct}")
 
     if "Platform" in df.columns:
