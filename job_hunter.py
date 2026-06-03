@@ -355,13 +355,18 @@ def check_compensation(job: dict) -> tuple:
     if interval in ("year", "annual", "yearly", "annually"):
         if lo >= ANNUAL_MIN:
             return True, f"Annual ${lo:,.0f} >= ${ANNUAL_MIN:,}"
-        return False, f"Annual ${lo:,.0f} < ${ANNUAL_MIN:,}"
+        if hi >= ANNUAL_MIN:
+            # min is below threshold but max meets it (e.g. $140K-$160K)
+            return True, f"Annual range ${lo:,.0f}-${hi:,.0f} (max >= ${ANNUAL_MIN:,})"
+        return False, f"Annual ${lo:,.0f}-${hi:,.0f} both < ${ANNUAL_MIN:,}"
 
     # Infer interval from magnitude
     if lo > 1_000:
         if lo >= ANNUAL_MIN:
             return True, f"~Annual ${lo:,.0f} >= ${ANNUAL_MIN:,}"
-        return False, f"~Annual ${lo:,.0f} < ${ANNUAL_MIN:,}"
+        if hi >= ANNUAL_MIN:
+            return True, f"~Annual range ${lo:,.0f}-${hi:,.0f} (max >= ${ANNUAL_MIN:,})"
+        return False, f"~Annual ${lo:,.0f}-${hi:,.0f} both < ${ANNUAL_MIN:,}"
 
     if lo <= 200:
         if lo <= HOURLY_MAX and hi >= HOURLY_MIN:
@@ -394,6 +399,51 @@ def is_relevant_title(title: str) -> tuple:
 #   MASTER FILTER
 # ==============================================================
 
+# Broad location strings that indicate remote (no specific city)
+_REMOTE_LOCATIONS = {
+    "united states", "usa", "us", "remote", "anywhere", "nationwide",
+    "work from home", "wfh", "north america", "remote us", "remote usa",
+}
+
+# Description phrases that confirm a position is remote
+_REMOTE_DESC_PHRASES = [
+    "fully remote", "100% remote", "remote position", "work remotely",
+    "work from home", "remote-first", "remote work", "remote worker",
+    "this is a remote", "position is remote", "role is remote",
+]
+
+
+def _is_effectively_remote(job: dict) -> bool:
+    """
+    Returns True when a job is remote, using three signals:
+      1. Structured is_remote field (most reliable)
+      2. Location string is broad / country-level (no city or state)
+      3. Description contains explicit remote-work phrases
+
+    LinkedIn in particular often omits is_remote=True for jobs that appear
+    in remote searches but use "United States" as the location field.
+    """
+    if job.get("is_remote", False):
+        return True
+
+    location = (job.get("location") or
+                job.get("city") or "").strip().lower()
+    if location in _REMOTE_LOCATIONS:
+        return True
+
+    # If city and state are both empty, the job has no specific location
+    city  = (job.get("city",  "") or "").strip()
+    state = (job.get("state", "") or "").strip()
+    if not city and not state:
+        return True
+
+    desc = (job.get("description", "") or "").lower()
+    if any(phrase in desc for phrase in _REMOTE_DESC_PHRASES):
+        return True
+
+    return False
+
+
 def filter_job(job: dict, seen: dict) -> tuple:
     """
     Returns (keep: bool, reason: str).
@@ -401,7 +451,7 @@ def filter_job(job: dict, seen: dict) -> tuple:
     """
 
     # 1. Remote
-    if not job.get("is_remote", False):
+    if not _is_effectively_remote(job):
         return False, "Not remote"
 
     # 2. Title relevance
