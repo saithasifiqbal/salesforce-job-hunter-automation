@@ -1,0 +1,14 @@
+# Secrets — never commit these
+.env
+*.json
+
+# Local Excel output (now replaced by Google Sheets)
+*.xlsx
+*.xls
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/

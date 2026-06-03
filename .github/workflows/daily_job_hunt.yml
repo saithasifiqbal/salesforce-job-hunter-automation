@@ -1,0 +1,35 @@
+name: Daily Salesforce Job Hunt
+
+on:
+  schedule:
+    # Runs every day at 09:00 UTC (4 AM EST / 1 AM PST)
+    # Catches jobs posted overnight before you start your day
+    - cron: '0 9 * * *'
+
+  # Lets you trigger a run manually from the GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  job-hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90        # Apify actor can take up to 10 min x 24 calls
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Job Hunter
+        env:
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python job_hunter.py
