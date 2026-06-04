@@ -244,8 +244,9 @@ def update_summary_tab(sh, df: pd.DataFrame, filter_stats: dict, duration: int):
         ["Duration (seconds)", duration],
         ["", ""],
         ["── FILTER BREAKDOWN ──", ""],
-        ["Not Remote / Hybrid (excluded)", filter_stats.get("not_remote", 0)],
+        ["Not Remote / On-site (excluded)", filter_stats.get("not_remote", 0)],
         ["Hybrid (excluded)",              filter_stats.get("hybrid", 0)],
+        ["Not US Location (excluded)",     filter_stats.get("not_us", 0)],
         ["Irrelevant Title (excluded)",    filter_stats.get("irrelevant_title", 0)],
         ["Already Collected (skipped)",    filter_stats.get("already_seen", 0)],
         ["Travel > 20% (excluded)",        filter_stats.get("travel", 0)],
@@ -507,6 +508,64 @@ def is_relevant_title(title: str) -> tuple:
 
 
 # ==============================================================
+#   US LOCATION ENFORCEMENT
+# ==============================================================
+
+# All 50 states + DC + PR as two-letter abbreviations
+_US_STATES_ABBR = {
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID",
+    "IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS",
+    "MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK",
+    "OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV",
+    "WI","WY","DC","PR",
+}
+
+
+def _is_us_based(job: dict) -> bool:
+    """
+    Returns True only when the job is confirmed to be in the United States.
+
+    Priority of checks:
+      1. Explicit country field — trusted if present
+      2. State field — if it matches a US state abbreviation → US
+      3. Location string — parse for US state abbreviation or US keywords
+      4. No location info at all → assume US (we searched with "United States")
+    """
+    country  = (job.get("country",  "") or "").strip().lower()
+    state    = (job.get("state",    "") or "").strip().upper()
+    city     = (job.get("city",     "") or "").strip()
+    location = (job.get("location", "") or "").strip().lower()
+
+    # ── Explicit country field ────────────────────────────────
+    _US_COUNTRY_VALUES = {"us", "usa", "united states", "united states of america", "u.s.", "u.s.a."}
+    if country and country in _US_COUNTRY_VALUES:
+        return True
+    if country and country not in _US_COUNTRY_VALUES:
+        return False     # explicitly non-US country (e.g. "ukraine", "germany", "ca")
+
+    # ── State abbreviation ────────────────────────────────────
+    if state and state in _US_STATES_ABBR:
+        return True
+
+    # ── Location string parsing ───────────────────────────────
+    # Look for US state abbreviation in location (e.g. "New York, NY" or "Chicago, IL, US")
+    parts = [p.strip().upper() for p in re.split(r'[,\s]+', location)]
+    if any(p in _US_STATES_ABBR for p in parts):
+        return True
+
+    # Explicit US keyword in location string
+    if any(kw in location for kw in ("united states", "u.s.", "remote us", "us remote", " usa")):
+        return True
+
+    # ── No location info at all → we searched with "United States" ──
+    if not country and not state and not city and not location:
+        return True
+
+    # Has partial location info we can't confirm as US
+    return False
+
+
+# ==============================================================
 #   REMOTE + HYBRID DETECTION
 # ==============================================================
 
@@ -537,31 +596,47 @@ _HYBRID_DEFINITIVE = [
 def _is_effectively_remote(job: dict) -> tuple:
     """
     Returns (is_remote: bool, work_type: str).
-    Trusts structured is_remote field; for untagged jobs infers from
-    location breadth and description phrases.
-    Rejects definitive hybrid-only arrangements.
+
+    Key behaviour change vs. previous version:
+    - When is_remote=True BUT the job has a specific city+state, we cross-check
+      the description for actual remote language. Job boards often miscategorise
+      on-site positions as remote (Pittsburgh on-site, FL on-site, etc.). If no
+      remote language is found in the description, the flag is overridden.
+    - Definitive hybrid phrases always reject, regardless of is_remote flag.
     """
-    # Trust structured field from job board
-    if job.get("is_remote", False):
-        return True, "Remote"
+    city  = (job.get("city",  "") or "").strip()
+    state = (job.get("state", "") or "").strip()
+    desc  = (job.get("description", "") or "").lower()
 
-    desc = (job.get("description", "") or "").lower()
+    has_specific_location = bool(city and state)
 
-    # Check for definitive hybrid phrases before accepting as remote
+    # Reject definitive hybrid arrangements first
     if any(phrase in desc for phrase in _HYBRID_DEFINITIVE):
         return False, "Hybrid"
 
-    # Infer remote from broad location (no specific city)
-    location = (job.get("location") or job.get("city") or "").strip().lower()
+    if job.get("is_remote", False):
+        if has_specific_location:
+            # Job board says remote, but there is a specific office city+state.
+            # Only trust the flag if the description also confirms remote work —
+            # many job boards incorrectly tag on-site postings as remote.
+            if any(phrase in desc for phrase in _REMOTE_DESC_PHRASES):
+                return True, "Remote"
+            return False, "On-site (is_remote flag unreliable — specific location, no remote language)"
+        return True, "Remote"
+
+    # is_remote is False or missing
+    # If the job has a specific city+state it is at an office location
+    if has_specific_location:
+        return False, "On-site (specific location)"
+
+    # Infer remote from broad location string
+    location = (job.get("location") or "").strip().lower()
     if location in _REMOTE_LOCATIONS:
         return True, "Remote (inferred: broad location)"
 
-    city  = (job.get("city",  "") or "").strip()
-    state = (job.get("state", "") or "").strip()
     if not city and not state:
         return True, "Remote (inferred: no location specified)"
 
-    # Description has explicit remote language
     if any(phrase in desc for phrase in _REMOTE_DESC_PHRASES):
         return True, "Remote (inferred: description)"
 
@@ -569,7 +644,7 @@ def _is_effectively_remote(job: dict) -> tuple:
 
 
 # ==============================================================
-#   MASTER FILTER  (remote · title · dedup · experience · compensation)
+#   MASTER FILTER  (remote · US · title · dedup · experience · compensation)
 #   Travel is handled separately in main() to capture Notes flags.
 # ==============================================================
 
@@ -581,7 +656,13 @@ def filter_job(job: dict, seen_urls: dict, seen_keys: set) -> tuple:
     if not is_remote:
         return False, f"Not remote ({work_type})"
 
-    # 2. Title relevance
+    # 2. United States location check
+    if not _is_us_based(job):
+        country  = (job.get("country",  "") or "unknown country").lower()
+        city     = (job.get("city",     "") or "")
+        return False, f"Not US — location: {city or country}"
+
+    # 3. Title relevance (was step 2)
     title_ok, title_reason = is_relevant_title(job.get("title", ""))
     if not title_ok:
         return False, title_reason
@@ -977,8 +1058,8 @@ def main():
     print("  🔍 Applying filters and scoring…")
 
     filter_stats = dict(
-        not_remote=0, hybrid=0, irrelevant_title=0, already_seen=0,
-        travel=0, low_experience=0, low_salary=0, passed=0,
+        not_remote=0, hybrid=0, not_us=0, irrelevant_title=0,
+        already_seen=0, travel=0, low_experience=0, low_salary=0, passed=0,
     )
     filtered = []
     new_seen = {}
@@ -994,13 +1075,14 @@ def main():
 
         if not keep:
             r = reason.lower()
-            if   "hybrid"    in r: filter_stats["hybrid"]          += 1
-            elif "not remote" in r: filter_stats["not_remote"]     += 1
+            if   "hybrid"    in r:                                  filter_stats["hybrid"]          += 1
+            elif "not remote" in r or "on-site" in r:              filter_stats["not_remote"]      += 1
+            elif "not us"    in r or "not us" in r:                filter_stats["not_us"]          += 1
             elif "keyword"   in r or "salesforce" in r or "title" in r:
-                                    filter_stats["irrelevant_title"] += 1
-            elif "already"   in r: filter_stats["already_seen"]    += 1
-            elif "yr"        in r: filter_stats["low_experience"]   += 1
-            elif "$"         in r: filter_stats["low_salary"]       += 1
+                                                                    filter_stats["irrelevant_title"] += 1
+            elif "already"   in r:                                  filter_stats["already_seen"]    += 1
+            elif "yr"        in r:                                  filter_stats["low_experience"]   += 1
+            elif "$"         in r:                                  filter_stats["low_salary"]       += 1
             continue
 
         # ── Travel check (separate — needs Notes flag on partial fail) ──
@@ -1045,8 +1127,9 @@ def main():
 
     # ── Stats ────────────────────────────────────────────────────
     print(f"\n  📊 Filter Breakdown:")
-    print(f"     Not remote           : {filter_stats['not_remote']}")
+    print(f"     Not remote / On-site : {filter_stats['not_remote']}")
     print(f"     Hybrid (rejected)    : {filter_stats['hybrid']}")
+    print(f"     Not US location      : {filter_stats['not_us']}")
     print(f"     Irrelevant title     : {filter_stats['irrelevant_title']}")
     print(f"     Already collected    : {filter_stats['already_seen']}")
     print(f"     Travel > {MAX_TRAVEL_PCT}%       : {filter_stats['travel']}")

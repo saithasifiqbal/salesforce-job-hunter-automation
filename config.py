@@ -47,9 +47,10 @@ SEARCH_KEYWORDS = ICP["job_titles"]
 
 # ── Search Settings ─────────────────────────────────────────────
 
+# "United States" + isRemote=True in the API call is sufficient.
+# Do NOT add "Remote" here — that returns worldwide remote jobs (Ukraine, Germany, etc.)
 LOCATIONS = [
     "United States",
-    "Remote",
 ]
 
 # Platforms passed to openclawai/job-board-scraper
