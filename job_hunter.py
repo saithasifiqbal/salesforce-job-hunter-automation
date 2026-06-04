@@ -630,7 +630,10 @@ def _is_effectively_remote(job: dict) -> tuple:
     """
     city  = (job.get("city",  "") or "").strip()
     state = (job.get("state", "") or "").strip()
+    # Normalise spelling variants so phrase lists only need one form:
+    #   "onsite" → "on-site",  "work from home" already covered
     desc  = (job.get("description", "") or "").lower()
+    desc  = desc.replace("onsite", "on-site").replace("on site", "on-site")
 
     has_specific_location = bool(city and state)
 
