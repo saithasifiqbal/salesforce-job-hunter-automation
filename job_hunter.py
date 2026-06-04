@@ -574,22 +574,42 @@ _REMOTE_LOCATIONS = {
     "work from home", "wfh", "north america", "remote us", "remote usa",
 }
 
+# Strong, unambiguous remote-only phrases.
+# Intentionally tight — "remote work" alone is NOT here because hybrid jobs
+# also say "remote work X days". Only phrases that mean 100% remote qualify.
 _REMOTE_DESC_PHRASES = [
-    "fully remote", "100% remote", "remote position", "work remotely",
-    "work from home", "remote-first", "remote work", "remote worker",
+    "fully remote", "100% remote", "remote position",
+    "work remotely", "work from home", "remote-first",
     "this is a remote", "position is remote", "role is remote",
+    "remote only", "fully distributed", "remote-only",
 ]
 
 # Phrases that definitively indicate a hybrid (not fully-remote) arrangement
 _HYBRID_DEFINITIVE = [
     "hybrid work schedule", "hybrid work model", "hybrid work arrangement",
     "hybrid schedule", "hybrid position", "hybrid role", "hybrid setting",
+    "hybrid opportunity", "hybrid work environment", "hybrid work option",
     "days per week in office", "days per week on-site",
     "days in the office per week", "days on site per week",
     "days in office per week", "in-office days required",
     "office presence required", "required to work on-site",
     "required to be in office", "partially remote", "part-time remote",
     "split between office and remote",
+    # "X days in office / at office" patterns (no "hybrid" word needed)
+    "days in office", "days at the office", "days at our office",
+    "days in our office", "days on-site per week",
+    "in office full time", "in-office full time",
+]
+
+# Weak office-presence signals — used as a secondary check when a job has
+# is_remote=True but also a specific city+state (Gap A above).
+# If ANY of these appear alongside a remote phrase, the job is treated as hybrid.
+_OFFICE_HINTS = [
+    "visit the office", "visit our office", "office visits",
+    "come into the office", "come to the office", "in the office",
+    "at the office", "office days", "in-person collaboration",
+    "in person at our", "in-person at our",
+    "report to the office", "at our location",
 ]
 
 # Phrases that definitively mean on-site, regardless of any is_remote=True flag.
@@ -649,15 +669,28 @@ def _is_effectively_remote(job: dict) -> tuple:
     if any(phrase in desc for phrase in _ONSITE_OVERRIDE_PHRASES):
         return False, "On-site (description override)"
 
-    # ── 2. Hybrid detection (phrase list + standalone word) ──────
+    # ── 2. Hybrid detection — three sub-checks ───────────────────
+
+    # 2a. Phrase list (multi-word exact phrases including "days in office")
     if any(phrase in desc for phrase in _HYBRID_DEFINITIVE):
         return False, "Hybrid"
 
-    # Catch any remaining hybrid mentions that don't match the phrase list,
-    # e.g. "hybrid work environment", "Remote/hybrid", "hybrid opportunity",
-    # "hybrid 3 days", "a hybrid model" — the word "hybrid" on its own is
-    # almost always about work arrangement in a Salesforce job description.
-    # Exclude unrelated tech contexts: "hybrid cloud", "hybrid integration", etc.
+    # 2b. Day-count + office/on-site regex patterns (Gap B).
+    #     Catches "3 days in office", "2-3 days at the office", "office 2 days/week"
+    #     even when the word "hybrid" never appears.
+    _day_office = (
+        r'\b\d+\s*(?:[-–to]\s*\d+\s*)?days?\s+'
+        r'(?:per\s+week\s+|a\s+week\s+)?(?:in|at|on)\s+(?:the\s+)?(?:office|site)\b'
+    )
+    _office_day = (
+        r'\b(?:in|at|on)\s+(?:the\s+)?(?:office|site)\s+'
+        r'\d+\s*(?:[-–to]\s*\d+\s*)?days?\b'
+    )
+    if re.search(_day_office, desc) or re.search(_office_day, desc):
+        return False, "Hybrid (office-days pattern)"
+
+    # 2c. Standalone "hybrid" word — catches "Remote/hybrid", "hybrid work
+    #     environment", "hybrid opportunity" etc. Excludes tech contexts.
     if re.search(r'\bhybrid\b', desc) and not re.search(
         r'\bhybrid\s+(?:cloud|integration|deployment|architecture|'
         r'infrastructure|app(?:lication)?|solution|model\s+(?:of|for))',
@@ -669,10 +702,13 @@ def _is_effectively_remote(job: dict) -> tuple:
     if job.get("is_remote", False):
         if has_specific_location:
             # Job has a specific office location — only trust the flag if
-            # description also confirms remote work (fixes Pittsburgh, FL, etc.)
-            if any(phrase in desc for phrase in _REMOTE_DESC_PHRASES):
+            # description has STRONG remote language AND no conflicting
+            # office-presence hints (Gap A: "remote work 3 days, office 2 days").
+            has_strong_remote = any(phrase in desc for phrase in _REMOTE_DESC_PHRASES)
+            has_office_hint   = any(hint in desc for hint in _OFFICE_HINTS)
+            if has_strong_remote and not has_office_hint:
                 return True, "Remote"
-            return False, "On-site (is_remote flag unreliable — specific location, no remote language)"
+            return False, "On-site / Hybrid (specific location, conflicting signals)"
         return True, "Remote"
 
     # ── 5. is_remote=False with specific city+state ───────────────
