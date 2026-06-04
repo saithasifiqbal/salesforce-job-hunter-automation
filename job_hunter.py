@@ -209,13 +209,15 @@ def update_summary_tab(sh, df: pd.DataFrame, filter_stats: dict, duration: int):
     ws = _get_or_create_tab(sh, "Summary", rows=80, cols=4)
     ws.clear()
 
-    remote_c  = df["Remote Status"].str.contains("Remote", na=False).sum() if "Remote Status" in df.columns else 0
-    salary_c  = (df["Salary / Hourly Rate"] != "Not Listed").sum() if "Salary / Hourly Rate" in df.columns else 0
-    ft_c      = (df["Employment Type"].str.lower() == "fulltime").sum() if "Employment Type" in df.columns else 0
-    ct_c      = (df["Employment Type"].str.lower() == "contract").sum() if "Employment Type" in df.columns else 0
-    high_c    = (df["Match Score"] == "High").sum()   if "Match Score" in df.columns else 0
-    medium_c  = (df["Match Score"] == "Medium").sum() if "Match Score" in df.columns else 0
-    low_c     = (df["Match Score"] == "Low").sum()    if "Match Score" in df.columns else 0
+    # int() converts numpy.int64 → Python int (required for JSON serialization)
+    remote_c  = int(df["Remote Status"].str.contains("Remote", na=False).sum()) if "Remote Status" in df.columns else 0
+    salary_c  = int((df["Salary / Hourly Rate"] != "Not Listed").sum()) if "Salary / Hourly Rate" in df.columns else 0
+    ft_c      = int((df["Employment Type"].str.lower() == "fulltime").sum()) if "Employment Type" in df.columns else 0
+    ct_c      = int((df["Employment Type"].str.lower() == "contract").sum()) if "Employment Type" in df.columns else 0
+    high_c    = int((df["Match Score"] == "High").sum())   if "Match Score" in df.columns else 0
+    medium_c  = int((df["Match Score"] == "Medium").sum()) if "Match Score" in df.columns else 0
+    low_c     = int((df["Match Score"] == "Low").sum())    if "Match Score" in df.columns else 0
+    company_c = int(df["Company Name"].nunique()) if "Company Name" in df.columns else 0
 
     rows = [
         ["JOB HUNTING AI — LAST RUN SUMMARY", ""],
@@ -243,18 +245,18 @@ def update_summary_tab(sh, df: pd.DataFrame, filter_stats: dict, duration: int):
         ["Full-time Jobs",      ft_c],
         ["Contract Jobs",       ct_c],
         ["Jobs with Salary",    salary_c],
-        ["Unique Companies",    df["Company Name"].nunique() if "Company Name" in df.columns else 0],
+        ["Unique Companies",    company_c],
     ]
 
     if "Platform" in df.columns:
         rows += [["", ""], ["── BY PLATFORM ──", ""]]
         for plat, count in df["Platform"].value_counts().items():
-            rows.append([f"  {plat}", count])
+            rows.append([f"  {plat}", int(count)])
 
     if "Search Keyword" in df.columns:
         rows += [["", ""], ["── BY KEYWORD ──", ""]]
         for kw, count in df["Search Keyword"].value_counts().items():
-            rows.append([f"  {kw}", count])
+            rows.append([f"  {kw}", int(count)])
 
     ws.update("A1", rows, value_input_option="USER_ENTERED")
     print("  ✅ 'Summary' tab updated")
