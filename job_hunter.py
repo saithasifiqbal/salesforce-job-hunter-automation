@@ -139,16 +139,32 @@ def _get_or_create_tab(sh, title: str, rows: int = 10000, cols: int = 30):
 #   GOOGLE SHEETS — cross-run deduplication (Seen Jobs tab)
 # ==============================================================
 
-def load_seen_jobs_from_sheet(sh) -> dict:
-    """Read 'Seen Jobs' tab → dict {url: {title, company, seen_date}}."""
+def _job_key(title: str, company: str) -> str:
+    """
+    Normalized composite key for cross-platform deduplication.
+    Same job posted on Indeed, LinkedIn, and Glassdoor produces
+    the same key so only the first-seen copy is kept.
+    """
+    def _norm(s):
+        return re.sub(r'\s+', ' ', (s or "").lower().strip())
+    return f"{_norm(title)}|||{_norm(company)}"
+
+
+def load_seen_jobs_from_sheet(sh) -> tuple:
+    """
+    Returns (seen_urls: dict, seen_keys: set).
+      seen_urls — {url: {title, company, seen_date}}  for URL-based dedup
+      seen_keys — {_job_key(title, company)}           for cross-platform dedup
+    Both are built from the same 'Seen Jobs' tab data.
+    """
     try:
         ws = sh.worksheet("Seen Jobs")
         all_vals = ws.get_all_values()
     except gspread.exceptions.WorksheetNotFound:
-        return {}
+        return {}, set()
 
     if len(all_vals) <= 1:
-        return {}
+        return {}, set()
 
     headers = all_vals[0]
     url_i   = headers.index("URL")       if "URL"       in headers else 0
@@ -156,15 +172,18 @@ def load_seen_jobs_from_sheet(sh) -> dict:
     co_i    = headers.index("Company")   if "Company"   in headers else 2
     date_i  = headers.index("Seen Date") if "Seen Date" in headers else 3
 
-    seen = {}
+    seen_urls: dict = {}
+    seen_keys: set  = set()
     for row in all_vals[1:]:
-        if len(row) > url_i and row[url_i]:
-            seen[row[url_i]] = {
-                "title"     : row[title_i] if len(row) > title_i else "",
-                "company"   : row[co_i]    if len(row) > co_i    else "",
-                "seen_date" : row[date_i]  if len(row) > date_i  else "",
-            }
-    return seen
+        url     = row[url_i]   if len(row) > url_i   else ""
+        title   = row[title_i] if len(row) > title_i else ""
+        company = row[co_i]    if len(row) > co_i    else ""
+        date    = row[date_i]  if len(row) > date_i  else ""
+        if url:
+            seen_urls[url] = {"title": title, "company": company, "seen_date": date}
+        if title and company:
+            seen_keys.add(_job_key(title, company))
+    return seen_urls, seen_keys
 
 
 def update_seen_jobs_tab(sh, new_entries: dict):
@@ -554,7 +573,7 @@ def _is_effectively_remote(job: dict) -> tuple:
 #   Travel is handled separately in main() to capture Notes flags.
 # ==============================================================
 
-def filter_job(job: dict, seen: dict) -> tuple:
+def filter_job(job: dict, seen_urls: dict, seen_keys: set) -> tuple:
     """Returns (keep: bool, reason: str)."""
 
     # 1. Remote + hybrid check
@@ -567,11 +586,19 @@ def filter_job(job: dict, seen: dict) -> tuple:
     if not title_ok:
         return False, title_reason
 
-    # 3. Cross-run deduplication
-    url = (job.get("job_url_direct") or job.get("job_url") or job.get("url") or "")
-    if url and url in seen:
-        prev_date = seen[url].get("seen_date", "?")
+    # 3. Cross-run deduplication — two signals:
+    #    a) exact URL match (same platform, same post)
+    #    b) title+company key match (same job on a different platform)
+    url     = (job.get("job_url_direct") or job.get("job_url") or job.get("url") or "")
+    title   = (job.get("title",   "") or "")
+    company = (job.get("company", "") or "")
+
+    if url and url in seen_urls:
+        prev_date = seen_urls[url].get("seen_date", "?")
         return False, f"Already collected on {prev_date}"
+
+    if title and company and _job_key(title, company) in seen_keys:
+        return False, "Already collected (same job, different platform)"
 
     # 4. Experience
     desc    = job.get("description", "") or ""
@@ -916,9 +943,10 @@ def main():
 
     # ── Connect to Google Sheets ────────────────────────────────
     print("\n  🔗 Connecting to Google Sheets…")
-    sh   = get_google_sheet()
-    seen = load_seen_jobs_from_sheet(sh)
-    print(f"  📦 Previously seen : {len(seen)} jobs (cross-run dedup loaded)")
+    sh = get_google_sheet()
+    seen_urls, seen_keys = load_seen_jobs_from_sheet(sh)
+    print(f"  📦 Previously seen : {len(seen_urls)} jobs (URL) / "
+          f"{len(seen_keys)} unique title+company keys (cross-platform dedup)")
 
     # ── Fetch all raw jobs ──────────────────────────────────────
     all_raw: list = []
@@ -962,7 +990,7 @@ def main():
         jt  = job.pop("_type", "Unknown")
 
         # ── Core filters ──────────────────────────────────────
-        keep, reason = filter_job(job, seen)
+        keep, reason = filter_job(job, seen_urls, seen_keys)
 
         if not keep:
             r = reason.lower()
@@ -1002,16 +1030,16 @@ def main():
         all_notes = "; ".join(filter(None, [existing_notes, score_notes]))
         cleaned["Notes"] = all_notes
 
-        # ── Register in seen (cross-run + within-run dedup) ──
+        # ── Register in seen (prevents re-fetch on next run) ──
+        job_title   = cleaned["Job Title"]
+        job_company = cleaned["Company Name"]
         url = cleaned.get("Job URL", "")
         if url and url != "N/A":
-            entry = {
-                "title"     : cleaned["Job Title"],
-                "company"   : cleaned["Company Name"],
-                "seen_date" : today,
-            }
-            seen[url]     = entry
-            new_seen[url] = entry
+            entry = {"title": job_title, "company": job_company, "seen_date": today}
+            seen_urls[url] = entry
+            new_seen[url]  = entry
+        # Always register the title+company key (catches cross-platform duplicates)
+        seen_keys.add(_job_key(job_title, job_company))
 
         filtered.append(cleaned)
 
@@ -1032,16 +1060,18 @@ def main():
 
     df = pd.DataFrame(filtered)
 
-    # ── Within-run deduplication ─────────────────────────────────
+    # ── Within-run deduplication (cross-platform) ────────────────
+    # Uses Job Title + Company Name only — no Platform — so the same
+    # job found on LinkedIn, Indeed, and Glassdoor collapses to one row.
     before = len(df)
     df.drop_duplicates(
-        subset=["Job Title", "Company Name", "Platform"],
+        subset=["Job Title", "Company Name"],
         keep="first",
         inplace=True,
     )
     removed = before - len(df)
     if removed:
-        print(f"  🧹 Removed {removed} within-run duplicates")
+        print(f"  🧹 Removed {removed} cross-platform duplicates")
 
     # ── Sort: High → Medium → Low → newest date → C2C mention ──
     score_rank = {"High": 0, "Medium": 1, "Low": 2}
@@ -1077,7 +1107,7 @@ def main():
     print(f"  ✅ COMPLETED in {duration}s")
     print(f"  📊 Google Sheet ID    : {GOOGLE_SHEET_ID}")
     print(f"  🎯 Jobs appended      : {len(df)}")
-    print(f"  🔄 Seen jobs total    : {len(seen)}")
+    print(f"  🔄 Seen jobs total    : {len(seen_urls)} URLs / {len(seen_keys)} title+company keys")
 
     if "Employment Type" in df.columns:
         ft = (df["Employment Type"].str.lower() == "fulltime").sum()
