@@ -592,17 +592,41 @@ _HYBRID_DEFINITIVE = [
     "split between office and remote",
 ]
 
+# Phrases that definitively mean on-site, regardless of any is_remote=True flag.
+# Handles government contractors (Steampunk, Booz Allen, SAIC, etc.) and other
+# firms that say "remote" loosely but require physical presence.
+_ONSITE_OVERRIDE_PHRASES = [
+    # Direct on-site statements
+    "must report to", "required to report to", "must work on-site",
+    "must be on-site", "on-site required", "on-site position",
+    "this position is on-site", "this role is on-site",
+    # Government/facility presence (common in DC-area contractor jobs)
+    "must be located", "must reside", "work at customer site",
+    "work at government", "work at client site", "at the client",
+    "at a government facility", "at government facilities",
+    # Commuting requirements
+    "must be able to commute", "ability to commute",
+    "commutable distance", "within commuting distance",
+    # Reporting to headquarters / specific office
+    "report to our office", "report to the office",
+    "at our headquarters", "at headquarters",
+    "working from our", "based in our",
+]
+
 
 def _is_effectively_remote(job: dict) -> tuple:
     """
     Returns (is_remote: bool, work_type: str).
 
-    Key behaviour change vs. previous version:
-    - When is_remote=True BUT the job has a specific city+state, we cross-check
-      the description for actual remote language. Job boards often miscategorise
-      on-site positions as remote (Pittsburgh on-site, FL on-site, etc.). If no
-      remote language is found in the description, the flag is overridden.
-    - Definitive hybrid phrases always reject, regardless of is_remote flag.
+    Signal priority (highest to lowest):
+      1. Definitive on-site override phrases in description → always On-site
+      2. Definitive hybrid phrases in description → always Hybrid
+      3. is_remote=True with specific city+state → require description confirmation
+      4. is_remote=True with no specific location → Remote
+      5. is_remote=False with specific city+state → On-site
+      6. Broad location string → Remote
+      7. No city/state at all → Remote (inferred)
+      8. Description has remote phrases → Remote (inferred)
     """
     city  = (job.get("city",  "") or "").strip()
     state = (job.get("state", "") or "").strip()
@@ -610,33 +634,38 @@ def _is_effectively_remote(job: dict) -> tuple:
 
     has_specific_location = bool(city and state)
 
-    # Reject definitive hybrid arrangements first
+    # ── 1. On-site override (beats everything, including is_remote=True) ──
+    if any(phrase in desc for phrase in _ONSITE_OVERRIDE_PHRASES):
+        return False, "On-site (description override)"
+
+    # ── 2. Definitive hybrid phrases ──────────────────────────────
     if any(phrase in desc for phrase in _HYBRID_DEFINITIVE):
         return False, "Hybrid"
 
+    # ── 3 & 4. is_remote=True from job board ─────────────────────
     if job.get("is_remote", False):
         if has_specific_location:
-            # Job board says remote, but there is a specific office city+state.
-            # Only trust the flag if the description also confirms remote work —
-            # many job boards incorrectly tag on-site postings as remote.
+            # Job has a specific office location — only trust the flag if
+            # description also confirms remote work (fixes Pittsburgh, FL, etc.)
             if any(phrase in desc for phrase in _REMOTE_DESC_PHRASES):
                 return True, "Remote"
             return False, "On-site (is_remote flag unreliable — specific location, no remote language)"
         return True, "Remote"
 
-    # is_remote is False or missing
-    # If the job has a specific city+state it is at an office location
+    # ── 5. is_remote=False with specific city+state ───────────────
     if has_specific_location:
         return False, "On-site (specific location)"
 
-    # Infer remote from broad location string
+    # ── 6. Broad location string ───────────────────────────────────
     location = (job.get("location") or "").strip().lower()
     if location in _REMOTE_LOCATIONS:
         return True, "Remote (inferred: broad location)"
 
+    # ── 7. No location at all ──────────────────────────────────────
     if not city and not state:
         return True, "Remote (inferred: no location specified)"
 
+    # ── 8. Description confirms remote ────────────────────────────
     if any(phrase in desc for phrase in _REMOTE_DESC_PHRASES):
         return True, "Remote (inferred: description)"
 
