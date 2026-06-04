@@ -637,12 +637,32 @@ def _is_effectively_remote(job: dict) -> tuple:
 
     has_specific_location = bool(city and state)
 
+    # ── 0. Structured work-type field (some job boards return this) ──
+    work_type_field = (job.get("work_type") or job.get("workplace_type") or
+                       job.get("job_type_text") or "").lower()
+    if "hybrid" in work_type_field:
+        return False, "Hybrid (structured field)"
+    if any(w in work_type_field for w in ("on-site", "onsite", "in-office", "in office")):
+        return False, "On-site (structured field)"
+
     # ── 1. On-site override (beats everything, including is_remote=True) ──
     if any(phrase in desc for phrase in _ONSITE_OVERRIDE_PHRASES):
         return False, "On-site (description override)"
 
-    # ── 2. Definitive hybrid phrases ──────────────────────────────
+    # ── 2. Hybrid detection (phrase list + standalone word) ──────
     if any(phrase in desc for phrase in _HYBRID_DEFINITIVE):
+        return False, "Hybrid"
+
+    # Catch any remaining hybrid mentions that don't match the phrase list,
+    # e.g. "hybrid work environment", "Remote/hybrid", "hybrid opportunity",
+    # "hybrid 3 days", "a hybrid model" — the word "hybrid" on its own is
+    # almost always about work arrangement in a Salesforce job description.
+    # Exclude unrelated tech contexts: "hybrid cloud", "hybrid integration", etc.
+    if re.search(r'\bhybrid\b', desc) and not re.search(
+        r'\bhybrid\s+(?:cloud|integration|deployment|architecture|'
+        r'infrastructure|app(?:lication)?|solution|model\s+(?:of|for))',
+        desc
+    ):
         return False, "Hybrid"
 
     # ── 3 & 4. is_remote=True from job board ─────────────────────
