@@ -98,15 +98,22 @@ REQUIRED_TITLE_TERMS = [
 # Using full phrases (not bare words) prevents false positives —
 # e.g., "marketing" alone would also block "Salesforce Marketing Cloud Engineer".
 EXCLUDED_TITLE_TERMS = [
+    # Sales / account roles (non-technical)
+    "sales executive",          # "Sales Executive – Salesforce & Adobe"
     "sales representative", "sales rep",
+    "sales manager",
+    "inside sales",
+    "enterprise sales",         # "Enterprise Sales Executive – ..."
     "account executive", "account manager",
+    "business development",
+    # Customer-facing non-technical
     "customer success manager", "customer success",
+    # Marketing non-technical
     "marketing manager", "marketing coordinator",
     "marketing specialist", "marketing director",
+    # HR / admin
     "recruiter", "talent acquisition",
     "data entry",
-    "sales manager",
-    "business development",
-    "inside sales",
+    # Other non-technical
     "business analyst",
 ]
